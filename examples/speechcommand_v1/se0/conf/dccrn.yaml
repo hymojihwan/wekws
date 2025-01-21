@@ -1,0 +1,32 @@
+dataset_conf:
+    shuffle: true
+    shuffle_conf:
+        shuffle_size: 1500
+    batch_conf:
+        batch_size: 256
+
+model:
+    n_fft: 512
+    hop_len: 100
+    win_len: 400
+    win_type: hamming
+    masking_mode: E
+    rnn_layers: 2
+    rnn_units: 128
+    use_clstm: False
+    use_cbn: False
+    bidirectional: False
+    kernel_size: 5
+    kernel_num: [2, 16, 32, 64, 128, 256, 256]
+    loss_mode: MSLE
+
+optim: adam
+optim_conf:
+    lr: 0.001
+    weight_decay: 0.0001
+
+training_config:
+    grad_clip: 5
+    max_epoch: 100
+    log_interval: 10
+
