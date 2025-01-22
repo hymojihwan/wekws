@@ -4,17 +4,17 @@
 
 . ./path.sh
 
-stage=-1
-stop_stage=4
+stage=6
+stop_stage=6
 num_keywords=11
 
-config=conf/mdtc.yaml
+config=conf/ds_tcn.yaml
 norm_mean=false
 norm_var=false
-gpus="0"
+gpus="0,1,2,3"
 
 checkpoint=
-dir=exp/mdtc
+dir=exp/ds_tcn
 
 num_average=10
 score_checkpoint=$dir/avg_${num_average}.pt
@@ -22,19 +22,20 @@ score_checkpoint=$dir/avg_${num_average}.pt
 # your data dir
 download_dir=./data/local
 speech_command_dir=$download_dir/speech_commands_v1
+noisy_dir=/DB/speech_commands_v1
 . tools/parse_options.sh || exit 1;
 
 set -euo pipefail
 
 if [ ${stage} -le -1 ] && [ ${stop_stage} -ge -1 ]; then
-  echo "Download and extract all datasets"
+  echo "Stage -1 : Download and extract all datasets"
   local/data_download.sh --dl_dir $download_dir
   python local/split_dataset.py $download_dir/speech_commands_v1
 fi
 
 
 if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
-  echo "Start preparing Kaldi format files"
+  echo "Stage 0 : Start preparing Kaldi format files"
   for x in train test valid;
   do
     data=data/$x
@@ -47,7 +48,7 @@ fi
 
 
 if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
-  echo "Compute CMVN and Format datasets"
+  echo "Stage 1 : Compute CMVN and Format datasets"
   tools/compute_cmvn_stats.py --num_workers 16 --train_config $config \
     --in_scp data/train/wav.scp \
     --out_cmvn data/train/global_cmvn
@@ -61,7 +62,7 @@ fi
 
 
 if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
-  echo "Start training ..."
+  echo "Stage 2 : Start training ..."
   mkdir -p $dir
   cmvn_opts=
   $norm_mean && cmvn_opts="--cmvn_file data/train/global_cmvn"
@@ -82,6 +83,7 @@ fi
 
 if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
   # Do model average
+  echo "Stage 3 : Averaging model"
   python wekws/bin/average_model.py \
     --dst_model $score_checkpoint \
     --src_path $dir  \
@@ -89,6 +91,7 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
     --val_best
 
   # Testing
+  echo "Stage 3 : Compute Accuracy"
   result_dir=$dir/test_$(basename $score_checkpoint)
   mkdir -p $result_dir
   python wekws/bin/compute_accuracy.py --gpu 3 \
@@ -101,6 +104,7 @@ fi
 
 
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
+  echo "Stage 4 : Export jit & onnx"
   jit_model=$(basename $score_checkpoint | sed -e 's:.pt$:.zip:g')
   onnx_model=$(basename $score_checkpoint | sed -e 's:.pt$:.onnx:g')
   python wekws/bin/export_jit.py \
@@ -112,4 +116,57 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     --config $dir/config.yaml \
     --checkpoint $score_checkpoint \
     --onnx_model $dir/$onnx_model
+fi
+
+if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
+    echo "Stage 5 : Prepare noisy datasets"
+    for x in noisy_test noisy_valid;
+      do
+      data_combined=data/$x
+      mkdir -p $data_combined
+      > $data_combined/wav.list
+        # make wav.scp utt2spk text file
+        for noise in speech music noise;
+          do
+            data=data/${noise}_$x
+            mkdir -p $data
+            find $noisy_dir/$x/$noise -name *.wav | grep -v "_background_noise_" > $data/wav.list
+            find $noisy_dir/$x/$noise -name *.wav | grep -v "_background_noise_" >> $data_combined/wav.list
+            python local/prepare_speech_command.py --wav_list=$data/wav.list --data_dir=$data
+          done
+      python local/prepare_speech_command.py --wav_list=$data_combined/wav.list --data_dir=$data_combined
+      done
+
+    for x in noisy_valid noisy_test; do
+      for noise in speech music noise; do
+          data=data/${noise}_${x}
+          tools/wav_to_duration.sh --nj 8 $data/wav.scp $data/wav.dur
+          tools/make_list.py $data/wav.scp $data/text \
+              $data/wav.dur $data/data.list
+      done
+
+      # 합쳐진 데이터셋 처리
+      data_combined=data/${x}
+      tools/wav_to_duration.sh --nj 8 $data_combined/wav.scp $data_combined/wav.dur
+      tools/make_list.py $data_combined/wav.scp $data_combined/text \
+          $data_combined/wav.dur $data_combined/data.list
+    done
+fi
+
+if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
+    echo "Stage 6 : Compute Accuracy of Noisy datasets"
+    result_dir=$dir/test_$(basename $score_checkpoint)
+    mkdir -p $result_dir
+    python monet/bin/compute_accuracy.py --gpu 0 \
+      --config $dir/config.yaml \
+      --test_data \
+        data/test/data.list \
+        data/noisy_test/data.list \
+        data/noise_noisy_test/data.list \
+        data/music_noisy_test/data.list \
+        data/speech_noisy_test/data.list \
+      --batch_size 256 \
+      --num_workers 8 \
+      --checkpoint $score_checkpoint \
+      --result_dir $result_dir
 fi

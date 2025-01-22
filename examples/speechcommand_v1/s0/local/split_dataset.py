@@ -47,8 +47,16 @@ if __name__ == '__main__':
     test_folder = os.path.join(args.root, 'test')
     train_folder = os.path.join(args.root, 'train')
 
-    os.mkdir(valid_folder)
-    os.mkdir(test_folder)
+    if not os.path.exists(valid_folder):
+        os.mkdir(valid_folder)
+        print(f"Directory '{valid_folder}' created.")
+    else:
+        print(f"Directory '{valid_folder}' already exists. Skipping creation.")
+    if not os.path.exists(test_folder):
+        os.mkdir(test_folder)
+        print(f"Directory '{test_folder}' created.")
+    else:
+        print(f"Directory '{test_folder}' already exists. Skipping creation.")
 
     move_files(audio_folder, test_folder, test_path)
     move_files(audio_folder, valid_folder, validation_path)
