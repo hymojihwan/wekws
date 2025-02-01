@@ -18,6 +18,12 @@ import argparse
 import copy
 import logging
 import os
+import matplotlib.pyplot as plt
+import multiprocessing
+
+
+from logging.handlers import QueueHandler, QueueListener
+from multiprocessing import Queue
 
 import torch
 import torch.distributed as dist
@@ -27,7 +33,8 @@ from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 
 from monet.model.se_model import init_model
-from monet.utils.train_utils import count_parameters, set_mannul_seed
+from monet.utils.file_utils import setup_logging
+from monet.utils.train_utils import count_parameters, set_mannul_seed, get_last_checkpoint
 from monet.utils.executor import Executor
 from monet.utils.checkpoint import load_checkpoint, save_checkpoint
 from monet.dataset.dataset import Dataset
@@ -89,11 +96,25 @@ def get_args():
     args = parser.parse_args()
     return args
 
+def save_loss_plot(train_losses, cv_losses, model_dir):
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label="Train")
+    plt.plot(cv_losses, label="Valid")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Loss Curve")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f"{model_dir}/loss.png")
+    plt.close()
+
+def plot_loss_async(train_losses, cv_losses, model_dir):
+    p = multiprocessing.Process(target=save_loss_plot, args=(train_losses, cv_losses, model_dir))
+    p.start()
 
 def main():
     args = get_args()
-    logging.basicConfig(level=logging.DEBUG,
-                        format='%(asctime)s %(levelname)s %(message)s')
+
     # Set random seed
     set_mannul_seed(args.seed)
     print(args)
@@ -107,6 +128,9 @@ def main():
     if world_size > 1:
         logging.info('training on multiple gpus, this gpu {}'.format(gpu))
         dist.init_process_group(backend=args.dist_backend)
+
+    log_file = os.path.join(args.model_dir, 'train.log') 
+    setup_logging(log_file, rank)
 
     train_conf = configs['dataset_conf']
     cv_conf = copy.deepcopy(train_conf)
@@ -139,24 +163,36 @@ def main():
 
     # Init asr model from configs
     model = init_model(configs['model'])
-    print(model)
+    logging.info("Model structure:")
+    logging.info(model)
     num_params = count_parameters(model)
-    print('the number of model params: {}'.format(num_params))
+    logging.info('the number of model params: {}'.format(num_params))
 
     # !!!IMPORTANT!!!
     # Try to export the model by script, if fails, we should refine
     # the code to satisfy the script export requirements
     executor = Executor()
     # If specify checkpoint, load some info from checkpoint
+
+    # Automatically find last checkpoint
+    last_epoch, last_checkpoint = get_last_checkpoint(args.model_dir)
     if args.checkpoint is not None:
         infos = load_checkpoint(model, args.checkpoint)
+    elif last_checkpoint is not None:
+        logging.info(f"Loading checkpoint: {last_checkpoint}")
+        infos = load_checkpoint(model, last_checkpoint)
+        start_epoch = last_epoch + 1
     else:
+        logging.info("No checkpoint found. Starting from scratch.")
         infos = {}
-    start_epoch = infos.get('epoch', -1) + 1
-    cv_loss = infos.get('cv_loss', 0.0)
+
+    start_epoch = infos.get('epoch', 0) + 1
+    train_losses = infos.get('train_losses', [])  
+    cv_losses = infos.get('cv_losses', [])  
     # get the last epoch lr
     lr_last_epoch = infos.get('lr', configs['optim_conf']['lr'])
     configs['optim_conf']['lr'] = lr_last_epoch
+
     model_dir = args.model_dir
     writer = None
     if rank == 0:
@@ -193,15 +229,18 @@ def main():
         save_checkpoint(model, save_model_path)
 
     # Start training loop
-    for epoch in range(start_epoch, num_epochs):
+    for epoch in range(start_epoch, num_epochs+1):
         train_dataset.set_epoch(epoch)
         training_config['epoch'] = epoch
         lr = optimizer.param_groups[0]['lr']
         logging.info('Epoch {} TRAIN info lr {}'.format(epoch, lr))
-        executor.train(model, optimizer, train_data_loader, device, writer,
+        train_loss = executor.train(model, optimizer, train_data_loader, device, writer,
                        training_config)
+        train_losses.append(train_loss)
+    
         cv_loss = executor.cv(model, cv_data_loader, device,
                                       training_config)
+        cv_losses.append(cv_loss)
         logging.info('Epoch {} CV info cv_loss {}'.format(
             epoch, cv_loss))
 
@@ -211,17 +250,25 @@ def main():
                 'epoch': epoch,
                 'lr': lr,
                 'cv_loss': cv_loss,
+                'train_losses': train_losses,
+                'cv_losses': cv_losses
             })
-            writer.add_scalar('epoch/cv_loss', cv_loss, epoch)
-            writer.add_scalar('epoch', epoch)
-            writer.add_scalar('epoch/lr', lr, epoch)
+            logging.info(f"Model saved: {save_model_path}")
+
+            writer.add_scalars('Loss', {'Train': train_loss, 'Valid': cv_loss}, epoch)
+            plot_loss_async(train_losses, cv_losses, model_dir)
+
         final_epoch = epoch
         scheduler.step(cv_loss)
 
     if final_epoch is not None and rank == 0:
         final_model_path = os.path.join(model_dir, 'final.pt')
         os.symlink('{}.pt'.format(final_epoch), final_model_path)
+        logging,info(f"Final model linked: {final_model_path}")
         writer.close()
+
+    logging.info("Training Finished.")
+        
 
 
 if __name__ == '__main__':

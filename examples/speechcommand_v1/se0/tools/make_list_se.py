@@ -19,18 +19,18 @@ import json
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='')
-    parser.add_argument('wav_file', help='wav file')
-    parser.add_argument('text_file', help='text file')
+    parser.add_argument('noisy_wav_file', help='noisy wav file')
+    parser.add_argument('clean_wav_file', help='clean wav file')
     parser.add_argument('duration_file', help='duration file')
     parser.add_argument('output_file', help='output list file')
     args = parser.parse_args()
 
-    wav_table = {}
-    with open(args.wav_file, 'r', encoding='utf8') as fin:
+    noisy_wav_table = {}
+    with open(args.noisy_wav_file, 'r', encoding='utf8') as fin:
         for line in fin:
             arr = line.strip().split()
             assert len(arr) == 2
-            wav_table[arr[0]] = arr[1]
+            noisy_wav_table[arr[0]] = arr[1]
 
     duration_table = {}
     with open(args.duration_file, 'r', encoding='utf8') as fin:
@@ -39,16 +39,17 @@ if __name__ == '__main__':
             assert len(arr) == 2
             duration_table[arr[0]] = float(arr[1])
 
-    with open(args.text_file, 'r', encoding='utf8') as fin, \
-         open(args.output_file, 'w', encoding='utf8') as fout:
+    clean_wav_table = {}
+    with open(args.clean_wav_file, 'r', encoding='utf8') as fin, \
+            open(args.output_file, 'w', encoding='utf8') as fout:
         for line in fin:
-            arr = line.strip().split(maxsplit=1)
+            arr = line.strip().split()
             key = arr[0]
-            clean = arr[1]
-            assert key in wav_table
-            noisy = wav_table[key]
+            clean_wav = arr[1]
+            assert key in noisy_wav_table
+            noisy_wav = noisy_wav_table[key]
             assert key in duration_table
             duration = duration_table[key]
-            line = dict(key=key, clean=clean, duration=duration, noisy=noisy)
+            line = dict(key=key, clean=clean_wav, duration=duration, noisy=noisy_wav)
             json_line = json.dumps(line, ensure_ascii=False)
             fout.write(json_line + '\n')

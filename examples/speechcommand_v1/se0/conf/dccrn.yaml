@@ -3,14 +3,14 @@ dataset_conf:
     shuffle_conf:
         shuffle_size: 1500
     batch_conf:
-        batch_size: 256
+        batch_size: 512
 
 model:
     n_fft: 512
     hop_len: 100
     win_len: 400
     win_type: hamming
-    masking_mode: E
+    masking_mode: C
     rnn_layers: 2
     rnn_units: 128
     use_clstm: False
@@ -18,11 +18,11 @@ model:
     bidirectional: False
     kernel_size: 5
     kernel_num: [2, 16, 32, 64, 128, 256, 256]
-    loss_mode: MSLE
+    loss_mode: SI-SNR
 
 optim: adam
 optim_conf:
-    lr: 0.001
+    lr: 0.0003
     weight_decay: 0.0001
 
 training_config:

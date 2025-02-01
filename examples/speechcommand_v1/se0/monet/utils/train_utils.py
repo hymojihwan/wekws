@@ -16,6 +16,7 @@
 import torch
 import numpy as np
 import random
+import re, os
 
 
 def set_mannul_seed(seed):
@@ -28,3 +29,25 @@ def set_mannul_seed(seed):
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def get_last_checkpoint(model_dir):
+    """
+    Finds the last saved checkpoint in the given directory.
+    
+    Args:
+        model_dir (str): Path to the directory containing checkpoint files.
+    
+    Returns:
+        Tuple[int, str]: Tuple containing the epoch number and the checkpoint path.
+    """
+    checkpoints = [
+        f for f in os.listdir(model_dir) if re.match(r'^\d+\.pt$', f)
+    ]
+    if not checkpoints:
+        return -1, None  # No checkpoints found
+
+    # Sort checkpoints by epoch number
+    checkpoints = sorted(checkpoints, key=lambda x: int(x.split('.')[0]))
+    last_checkpoint = checkpoints[-1]
+    last_epoch = int(last_checkpoint.split('.')[0])
+    return last_epoch, os.path.join(model_dir, last_checkpoint)

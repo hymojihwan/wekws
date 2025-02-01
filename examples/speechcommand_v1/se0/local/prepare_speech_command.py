@@ -24,36 +24,33 @@ if __name__ == '__main__':
         '--wav_list',
         required=True,
         help='full path of a wav file in google speech command dataset')
+    parser.add_argument(
+        '--clean_name',
+        required=True,
+        help='noise name')
+            
     parser.add_argument('--data_dir',
                         required=True,
                         help='folder to write kaldi format files')
     args = parser.parse_args()
 
     data_dir = args.data_dir
-    f_wav_scp = open(os.path.join(data_dir, 'wav.scp'), 'w')
-    f_text = open(os.path.join(data_dir, 'text'), 'w')
+    f_noisy_wav_scp = open(os.path.join(data_dir, 'noisy_wav.scp'), 'w')
+    f_clean_wav_scp = open(os.path.join(data_dir, 'clean_wav.scp'), 'w')
     with open(args.wav_list) as f:
         for line in f.readlines():
-            keyword, file_name = line.strip().split('/')[-2:]
-            clean_file_name = line.strip().split('/')[-1]
-            DB_dir = '/'.join(line.strip().split('/')[:3])
+            # /home/user/Workspace/wekws/examples/speechcommand_v1/s0/data/local/speech_commands_v1/train/one/cb2929ce_nohash_2.wav
+            keyword, file_name = line.strip().split('/')[-2:]   # bird, c2d15ea5_nohash_0.wav
+            clean_file_name = line.strip().split('/')[-1]       # c2d15ea5_nohash_0.wav
+            DB_dir = '/'.join(line.strip().split('/')[:-3])      # /home/user/Workspace/wekws/examples/speechcommand_v1/s0/data/local/speech_commands_v1/train
             
-            file_name_new = file_name.split('.')[0]
-            wav_id = '_'.join([keyword, file_name_new])
-            train_mode = line.strip().split('/')[3]
-            clean_mode = train_mode.split('_')[-1]
-            clean_file_dir = os.path.join(DB_dir, clean_mode, keyword, clean_file_name)
-            if train_mode == "noisy_train":
-                noise_list = ["music", "noise", "speech"]
-                random_noise = random.randrange(0,3)
-            else:
-                noise_list = ["babble", "cafe", "livingroom", "office"]
-                random_noise = random.randrange(0,4)
-
-            clean_file_name_new = clean_file_name.split('.')[0]
-            noisy_file_dir = os.path.join(DB_dir, train_mode, noise_list[random_noise], keyword, clean_file_name)
-            file_dir = line.strip()
-            f_wav_scp.writelines(wav_id + ' ' + noisy_file_dir + '\n')
-            f_text.writelines(wav_id + ' ' + clean_file_dir + '\n')
-    f_wav_scp.close()
-    f_text.close()
+            file_name_new = file_name.split('.')[0]             # c2d15ea5_nohash_0
+            wav_id = '_'.join([keyword, file_name_new])         # bird_c2d15ea5_nohash_0         
+            
+            clean_file_path = os.path.join(DB_dir, args.clean_name, keyword, clean_file_name)
+            noisy_file_path = line.strip()
+            
+            f_noisy_wav_scp.writelines(wav_id + ' ' + noisy_file_path + '\n')
+            f_clean_wav_scp.writelines(wav_id + ' ' + clean_file_path + '\n')
+    f_noisy_wav_scp.close()
+    f_clean_wav_scp.close()

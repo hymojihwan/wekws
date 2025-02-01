@@ -43,18 +43,35 @@ class Executor:
             num_utts = noisy_lengths.size(0)
             if num_utts == 0:
                 continue
+
+            # 모델 Forward Pass
             enhanced_spec, enhanced_signal = model(noisy)
-            loss = model.loss(enhanced_signal, target)
-                            
+
+            # 손실(loss) 계산
+            loss = model.module.loss(enhanced_signal, target)
+
+            # 역전파(Backpropagation)
             optimizer.zero_grad()
             loss.backward()
             grad_norm = clip_grad_norm_(model.parameters(), clip)
+
+            # 그래디언트가 유효할 때만 step 수행
             if torch.isfinite(grad_norm):
                 optimizer.step()
+
+            # 총 loss 저장
+            total_loss += loss.item()
+            num_total_batch += 1
+
             if batch_idx % log_interval == 0:
                 logging.debug(
                     'TRAIN Batch {}/{} loss {:.8f}'.format(
                         epoch, batch_idx, loss.item()))
+
+        # 평균 loss 반환 (에포크 전체에 대한)
+        avg_loss = total_loss / num_total_batch if num_total_batch > 0 else 0
+        return avg_loss  
+
 
     def cv(self, model, data_loader, device, args):
         ''' Cross validation on
@@ -76,7 +93,7 @@ class Executor:
                 if num_utts == 0:
                     continue
                 enhanced_spec, enhanced_signal = model(noisy)
-                loss = model.loss(enhanced_signal, target)
+                loss = model.module.loss(enhanced_signal, target)
                 if torch.isfinite(loss):
                     num_seen_utts += num_utts
                     total_loss += loss.item() * num_utts

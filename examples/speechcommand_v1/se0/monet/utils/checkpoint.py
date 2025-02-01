@@ -20,21 +20,21 @@ import re
 import yaml
 import torch
 
+def load_checkpoint(model: torch.nn.Module, path: str):
+    logging.info(f'Loading checkpoint from {path}')
+    state_dict = torch.load(path, map_location='cpu')
+    model.load_state_dict(state_dict)
 
-def load_checkpoint(model: torch.nn.Module, path: str) -> dict:
-    if torch.cuda.is_available():
-        logging.info('Checkpoint: loading from checkpoint %s for GPU' % path)
-        checkpoint = torch.load(path)
+    # 🔥 학습 정보 불러오기 (latest.yaml 우선 사용)
+    yaml_path = os.path.join(os.path.dirname(path), "latest.yaml")
+    if os.path.exists(yaml_path):
+        with open(yaml_path, 'r') as fin:
+            infos = yaml.load(fin, Loader=yaml.FullLoader)
+        logging.info(f'Loaded training info from {yaml_path}')
     else:
-        logging.info('Checkpoint: loading from checkpoint %s for CPU' % path)
-        checkpoint = torch.load(path, map_location='cpu')
-    model.load_state_dict(checkpoint)
-    info_path = re.sub('.pt$', '.yaml', path)
-    configs = {}
-    if os.path.exists(info_path):
-        with open(info_path, 'r') as fin:
-            configs = yaml.load(fin, Loader=yaml.FullLoader)
-    return configs
+        infos = {}
+
+    return infos
 
 
 def save_checkpoint(model: torch.nn.Module, path: str, infos=None):
@@ -42,7 +42,9 @@ def save_checkpoint(model: torch.nn.Module, path: str, infos=None):
     Args:
         infos (dict or None): any info you want to save.
     '''
-    logging.info('Checkpoint: save to checkpoint %s' % path)
+    logging.info(f'Checkpoint: saving to {path}')
+    
+    # 모델 state_dict 저장
     if isinstance(model, torch.nn.DataParallel):
         state_dict = model.module.state_dict()
     elif isinstance(model, torch.nn.parallel.DistributedDataParallel):
@@ -50,9 +52,13 @@ def save_checkpoint(model: torch.nn.Module, path: str, infos=None):
     else:
         state_dict = model.state_dict()
     torch.save(state_dict, path)
-    info_path = re.sub('.pt$', '.yaml', path)
+
+    # 🔥 항상 최신 정보는 "latest.yaml"에 저장
+    info_path = os.path.join(os.path.dirname(path), "latest.yaml")
     if infos is None:
         infos = {}
+    
     with open(info_path, 'w') as fout:
-        data = yaml.dump(infos)
-        fout.write(data)
+        yaml.dump(infos, fout)
+
+    logging.info(f'Checkpoint info saved to {info_path}')
