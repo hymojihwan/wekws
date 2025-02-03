@@ -4,8 +4,8 @@
 
 . ./path.sh
 
-stage=1
-stop_stage=1
+stage=7
+stop_stage=7
 num_keywords=11
 
 config=conf/dccrn.yaml
@@ -171,6 +171,6 @@ if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
   python monet/bin/test.py \
     --config $dir/config.yaml \
     --checkpoint $dir/10best_avg.pt \
-    --test_data data/noisy_test/data.list \
+    --test_data data/speech_noisy_test/data.list \
     --output_dir $result_dir
 fi

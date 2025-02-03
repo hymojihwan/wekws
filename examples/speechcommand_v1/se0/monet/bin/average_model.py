@@ -14,100 +14,100 @@ def get_args():
     parser.add_argument("--top_k", type=int, default=10, help="Number of best checkpoints to average")
     return parser.parse_args()
 
-def read_cv_loss(yaml_file):
+def read_latest_cv_losses(latest_yaml_path):
+    """  
+    `latest.yaml`에서 `cv_losses` 리스트를 읽어 반환  
     """
-    Read cv_loss from the given YAML file.
-    Args:
-        yaml_file (str): Path to the YAML file.
-    Returns:
-        float: cv_loss value if available, otherwise None.
-    """
-    with open(yaml_file, 'r') as f:
+    if not os.path.exists(latest_yaml_path):
+        logging.error(f"❌ latest.yaml not found at {latest_yaml_path}!")
+        return None, None
+
+    with open(latest_yaml_path, "r") as f:
         data = yaml.safe_load(f)
-    return data.get("cv_loss", None)
+
+    cv_losses = data.get("cv_losses", [])
+    epoch = data.get("epoch", None)
+
+    if not cv_losses or epoch is None:
+        logging.error("❌ No valid `cv_losses` or `epoch` found in latest.yaml!")
+        return None, None
+
+    return cv_losses, epoch
 
 def average_checkpoints(model_dir, output_path, top_k=10):
     """
-    Average the top-k best checkpoints in model_dir based on cv_loss and save the averaged model.
-    Args:
-        model_dir (str): Directory containing the model checkpoints and YAML files.
-        output_path (str): Path to save the averaged model.
-        top_k (int): Number of best checkpoints to average.
-    Returns:
-        used_checkpoints (list): List of checkpoints used for averaging.
+    🔥 `latest.yaml`에서 `cv_losses`를 읽어 가장 좋은 `top_k` 개 체크포인트 평균  
     """
-    # Find all checkpoint (.pt) files
+    latest_yaml_path = os.path.join(model_dir, "latest.yaml")
+    cv_losses, total_epochs = read_latest_cv_losses(latest_yaml_path)
+
+    if cv_losses is None:
+        logging.error("❌ Cannot proceed without `cv_losses` data!")
+        return []
+
+    # 🔥 1️⃣ 모든 체크포인트(.pt) 파일 가져오기  
     checkpoints = glob(os.path.join(model_dir, "*.pt"))
-    checkpoint_info = []
+    if not checkpoints:
+        logging.error("❌ No checkpoint files found in model directory!")
+        return []
 
-    for ckpt in checkpoints:
-        # Assume corresponding YAML file has the same name but with .yaml extension
-        yaml_file = re.sub(r'\.pt$', '.yaml', ckpt)
-        if os.path.exists(yaml_file):
-            cv_loss = read_cv_loss(yaml_file)
-            if cv_loss is not None:
-                checkpoint_info.append((ckpt, cv_loss))
+    # 🔥 2️⃣ 최신 `epoch` 값에 따라 체크포인트 이름 예측 (`<epoch>.pt` 형태)  
+    epoch_to_ckpt = {int(re.search(r"(\d+).pt$", ckpt).group(1)): ckpt for ckpt in checkpoints if re.search(r"(\d+).pt$", ckpt)}
 
-    # Sort checkpoints by cv_loss (lower is better)
-    checkpoint_info.sort(key=lambda x: x[1])
+    # 🔥 3️⃣ 최신 `cv_losses` 리스트와 `epoch`를 매칭  
+    valid_checkpoints = [(epoch_to_ckpt[i + 1], cv_losses[i]) for i in range(len(cv_losses)) if (i + 1) in epoch_to_ckpt]
 
-    # Select top-k checkpoints
-    top_checkpoints = checkpoint_info[:top_k]
+    if not valid_checkpoints:
+        logging.error("❌ No valid checkpoints matched with cv_losses!")
+        return []
+
+    # 🔥 4️⃣ `cv_loss`가 작은 `top_k` 개 체크포인트 선택  
+    valid_checkpoints.sort(key=lambda x: x[1])  # 작은 `cv_loss`가 우선  
+    top_checkpoints = valid_checkpoints[:top_k]
     used_checkpoints = [ckpt[0] for ckpt in top_checkpoints]
 
-    # Average model weights
-    logging.info(f"Averaging the following checkpoints: {used_checkpoints}")
+    logging.info(f"✅ Averaging the following checkpoints: {used_checkpoints}")
+
+    # 🔥 5️⃣ 모델 가중치 평균 계산  
     avg_state_dict = None
     for ckpt_path, _ in top_checkpoints:
         state_dict = torch.load(ckpt_path, map_location="cpu")
         if avg_state_dict is None:
-            # Initialize avg_state_dict as float to prevent type mismatch
             avg_state_dict = {k: torch.zeros_like(v, dtype=torch.float32) for k, v in state_dict.items()}
         for k, v in state_dict.items():
-            avg_state_dict[k] += v.float() / top_k  # Ensure v is converted to float
+            avg_state_dict[k] += v.float() / top_k  # 평균 계산  
 
-    # Save averaged model
+    # 🔥 6️⃣ 평균 모델 저장  
     torch.save(avg_state_dict, output_path)
-    logging.info(f"Averaged model saved to {output_path}")
+    logging.info(f"✅ Averaged model saved to {output_path}")
 
     return used_checkpoints
     
 def cleanup_checkpoints(model_dir, keep_checkpoints):
     """
-    Delete all checkpoints in model_dir except the ones in keep_checkpoints.
-    Also preserves the latest.yaml file.
-    
-    Args:
-        model_dir (str): Directory containing the model checkpoints.
-        keep_checkpoints (list): List of checkpoints to keep.
+    🔥 `latest.yaml`과 `10best_avg.pt`만 유지하고, 나머지 `.yaml`은 삭제
     """
     config_path = os.path.join(model_dir, "config.yaml")
     latest_yaml = os.path.join(model_dir, "latest.yaml")
-    
-    # 🔥 최신 config 및 latest.yaml 유지
-    keep_checkpoints.append(config_path)
-    keep_checkpoints.append(latest_yaml)
-    
-    # 🔥 .pt 체크포인트 및 .yaml 정보도 유지해야 함!
-    keep_yaml_files = [re.sub(r'\.pt$', '.yaml', ckpt) for ckpt in keep_checkpoints]
-    keep_checkpoints.extend(keep_yaml_files)
 
-    # ✅ 삭제 전에 유지할 체크포인트 확인
-    logging.info(f"Keeping checkpoints: {keep_checkpoints}")
+    # 🔥 1️⃣ 유지할 파일 리스트
+    keep_checkpoints.append(config_path)  # `config.yaml` 유지
+    keep_checkpoints.append(latest_yaml)  # `latest.yaml` 유지
 
-    # 🚀 모든 체크포인트(.pt) 확인 후 삭제
+    # 🔥 2️⃣ 불필요한 `n.pt` 체크포인트 삭제
     all_checkpoints = glob(os.path.join(model_dir, "*.pt"))
     for ckpt in all_checkpoints:
         if ckpt not in keep_checkpoints:
             os.remove(ckpt)
-            logging.info(f"Deleted checkpoint: {ckpt}")
+            logging.info(f"🗑️ Deleted checkpoint: {ckpt}")
 
-    # 🚀 Top-10 관련 YAML 파일 유지, 나머지는 삭제
+    # 🔥 3️⃣ 모든 `.yaml` 중 `latest.yaml` 제외하고 삭제
     all_yaml_files = glob(os.path.join(model_dir, "*.yaml"))
     for yaml_file in all_yaml_files:
         if yaml_file not in keep_checkpoints and yaml_file != latest_yaml:
             os.remove(yaml_file)
-            logging.info(f"Deleted YAML file: {yaml_file}")
+            logging.info(f"🗑️ Deleted YAML file: {yaml_file}")
+
 
 def copy_latest_yaml(model_dir, output_path):
     """

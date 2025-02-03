@@ -24,10 +24,26 @@ def get_args():
     return args
 
 
+def get_new_log_file(log_file):
+    """
+    🔥 기존 로그 파일이 있다면 test_1.log, test_2.log 형태로 새로운 파일 생성  
+    """
+    base_name, ext = os.path.splitext(log_file)
+    count = 1
+
+    while os.path.exists(log_file):
+        log_file = f"{base_name}_{count}{ext}"
+        count += 1
+
+    return log_file
+
+
 def setup_logging(log_file):
     """
-    Set up logging to file and console.
+    🔥 로그 파일이 존재하면 새로운 파일명으로 변경 후 저장  
     """
+    log_file = get_new_log_file(log_file)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -36,7 +52,7 @@ def setup_logging(log_file):
             logging.StreamHandler()
         ]
     )
-
+    logging.info(f"✅ Logging to {log_file}")
 
 def evaluate_metrics(clean, enhanced, sample_rate, metrics):
     results = {}
