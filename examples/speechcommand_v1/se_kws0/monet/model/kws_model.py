@@ -1,0 +1,1 @@
+../../../s0/wekws/model/kws_model.py
