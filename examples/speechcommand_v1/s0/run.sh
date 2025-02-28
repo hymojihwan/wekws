@@ -8,13 +8,14 @@ stage=6
 stop_stage=6
 num_keywords=11
 
-config=conf/ds_tcn.yaml
+config=conf/mdtc.yaml
 norm_mean=false
 norm_var=false
 gpus="0,1,2,3"
 
+enhanced_model=convtas
 checkpoint=
-dir=exp/ds_tcn
+dir=exp/mdtc
 
 num_average=10
 score_checkpoint=$dir/avg_${num_average}.pt
@@ -83,12 +84,12 @@ fi
 
 if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
   # Do model average
-  echo "Stage 3 : Averaging model"
-  python wekws/bin/average_model.py \
-    --dst_model $score_checkpoint \
-    --src_path $dir  \
-    --num ${num_average} \
-    --val_best
+  # echo "Stage 3 : Averaging model"
+  # python wekws/bin/average_model.py \
+  #   --dst_model $score_checkpoint \
+  #   --src_path $dir  \
+  #   --num ${num_average} \
+  #   --val_best
 
   # Testing
   echo "Stage 3 : Compute Accuracy"
@@ -161,12 +162,80 @@ if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
       --config $dir/config.yaml \
       --test_data \
         data/test/data.list \
-        data/noisy_test/data.list \
-        data/noise_noisy_test/data.list \
-        data/music_noisy_test/data.list \
-        data/speech_noisy_test/data.list \
+        data/convtasnet_enhanced_noisy_test/data.list \
+        data/convtasnet_enhanced_noise_noisy_test/data.list \
+        data/convtasnet_enhanced_music_noisy_test/data.list \
+        data/convtasnet_enhanced_speech_noisy_test/data.list \
       --batch_size 256 \
       --num_workers 8 \
       --checkpoint $score_checkpoint \
       --result_dir $result_dir
+fi
+
+if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
+    echo "Stage 7 : Prepare enhanced noisy datasets"
+    for x in enhanced_noisy_test enhanced_music_noisy_test enhanced_noise_noisy_test enhanced_speech_noisy_test;
+    do
+      data=data/${enhanced_model}_${x}
+      mkdir -p $data
+      find $speech_command_dir/$enhanced_model/$x -name '*.wav' | grep -v "_background_noise_" > $data/wav.list
+      python local/prepare_speech_command.py --wav_list=$data/wav.list --data_dir=$data
+      tools/wav_to_duration.sh --nj 8 $data/wav.scp $data/wav.dur
+      tools/make_list.py $data/wav.scp $data/text \
+              $data/wav.dur $data/data.list
+    done
+
+fi
+
+if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
+    echo "Stage 8 : Compute Accuracy of Enhanced Noisy datasets"
+    for x in enhanced_noisy_test enhanced_music_noisy_test enhanced_noise_noisy_test enhanced_speech_noisy_test;
+    do
+    result_dir=$dir/test_$(basename $score_checkpoint)
+    mkdir -p $result_dir
+    python monet/bin/compute_accuracy.py --gpu 0 \
+      --config $dir/config.yaml \
+      --test_data \
+        data/enhanced_noisy_test/data.list \
+        data/enhanced_noise_noisy_test/data.list \
+        data/enhanced_music_noisy_test/data.list \
+        data/enhanced_speech_noisy_test/data.list \
+      --batch_size 256 \
+      --num_workers 8 \
+      --checkpoint $score_checkpoint \
+      --result_dir $result_dir
+    done
+fi
+
+if [ ${stage} -le 9 ] && [ ${stop_stage} -ge 9 ]; then
+    echo "Stage 9 : Prepare enhanced noisy training datasets"
+    for x in enhanced_noisy_train;
+    do
+      data=data/${enhanced_model}_$x
+      mkdir -p $data
+      find $speech_command_dir/${enhanced_model}/$x -name '*.wav' | grep -v "_background_noise_" > $data/wav.list
+      python local/prepare_speech_command.py --wav_list=$data/wav.list --data_dir=$data
+      tools/wav_to_duration.sh --nj 8 $data/wav.scp $data/wav.dur
+      tools/make_list.py $data/wav.scp $data/text \
+              $data/wav.dur $data/data.list
+    done
+fi
+
+if [ ${stage} -le 10 ] && [ ${stop_stage} -ge 10 ]; then
+  echo "Stage 10 : Start training ..."
+  mkdir -p $dir
+  cmvn_opts=
+  $norm_mean && cmvn_opts="--cmvn_file data/train/global_cmvn"
+  $norm_var && cmvn_opts="$cmvn_opts --norm_var"
+  num_gpus=$(echo $gpus | awk -F ',' '{print NF}')
+  torchrun --standalone --nnodes=1 --nproc_per_node=$num_gpus \
+   wekws/bin/train.py --gpus $gpus \
+    --config $config \
+    --train_data data/${enhanced_model}_enhanced_noisy_train/data.list \
+    --cv_data data/noisy_valid/data.list \
+    --model_dir $dir \
+    --num_workers 8 \
+    --num_keywords $num_keywords \
+    $cmvn_opts \
+    ${checkpoint:+--checkpoint $checkpoint}
 fi

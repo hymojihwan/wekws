@@ -1,34 +1,27 @@
-# Copyright (c) 2020 Binbin Zhang
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-from __future__ import print_function
-
 import argparse
 import copy
 import logging
 import os
-
-import torch
-import torch.distributed as dist
-import torch.optim as optim
+import time
+import multiprocessing
 import yaml
+import matplotlib.pyplot as plt
+import numpy as np
+from tqdm import tqdm
+import torch
+import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
+
+import torch.nn.functional as F
+import torch.distributed as dist
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 
-from monet.model.se_model import init_model
-from monet.utils.train_utils import count_parameters, set_mannul_seed
-from monet.utils.executor import Executor
+from monet.model.bc_resnet import BCResNets
+from monet.utils.file_utils import setup_logging
+from monet.utils.train_utils import (
+    count_parameters, set_mannul_seed, get_last_checkpoint, display_epoch_progress
+)
 from monet.utils.checkpoint import load_checkpoint, save_checkpoint
 from monet.dataset.dataset import Dataset
 
@@ -60,7 +53,7 @@ def get_args():
                         help='num of subprocess workers for reading')
     parser.add_argument('--pin_memory',
                         action='store_true',
-                        default=False,
+                        default=True,
                         help='Use pinned memory buffers used for reading')
     parser.add_argument('--cmvn_file', default=None, help='global cmvn file')
     parser.add_argument('--norm_var',
@@ -71,92 +64,125 @@ def get_args():
                         default=1,
                         type=int,
                         help='number of keywords')
-    parser.add_argument('--min_duration',
-                        default=50,
-                        type=int,
-                        help='min duration frames of the keyword')
     parser.add_argument('--prefetch',
                         default=100,
                         type=int,
                         help='prefetch number')
-    parser.add_argument('--reverb_lmdb',
-                        default=None,
-                        help='reverb lmdb file')
-    parser.add_argument('--noise_lmdb',
-                        default=None,
-                        help='noise lmdb file')
 
     args = parser.parse_args()
     return args
 
 
+# ✅ Loss 플로팅 함수 (비동기 실행)
+def save_loss_plot(train_losses, cv_losses, model_dir, tag=""):
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label="Train")
+    plt.plot(cv_losses, label="Valid")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(f"Loss Curve ({tag})")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f"{model_dir}/{tag}_loss.png")
+    plt.close()
+
+def plot_loss_async(train_losses, cv_losses, model_dir, tag=""):
+    p = multiprocessing.Process(target=save_loss_plot, args=(train_losses, cv_losses, model_dir, tag))
+    p.start()
+
+def get_data_list_length(data_list_file):
+    """ data.list 파일의 줄 개수를 세어 데이터셋 길이를 반환 """
+    with open(data_list_file, "r") as f:
+        return sum(1 for _ in f)  # 🔥 총 라인 개수 반환
+
 def main():
     args = get_args()
-    logging.basicConfig(level=logging.DEBUG,
-                        format='%(asctime)s %(levelname)s %(message)s')
-    # Set random seed
     set_mannul_seed(args.seed)
-    print(args)
+
+    # Config 파일 로드
     with open(args.config, 'r') as fin:
         configs = yaml.load(fin, Loader=yaml.FullLoader)
 
-    rank = int(os.environ['LOCAL_RANK'])
-    world_size = int(os.environ['WORLD_SIZE'])
+    # Multi-GPU 설정
+    rank = int(os.environ.get('LOCAL_RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
     gpu = int(args.gpus.split(',')[rank])
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
+    
     if world_size > 1:
-        logging.info('training on multiple gpus, this gpu {}'.format(gpu))
+        logging.info(f'Training on multiple GPUs, current GPU: {gpu}')
         dist.init_process_group(backend=args.dist_backend)
 
+    # Logging 설정
+    log_file = os.path.join(args.model_dir, 'train.log')
+    setup_logging(log_file, rank)
+
+    # Dataset 설정
     train_conf = configs['dataset_conf']
     cv_conf = copy.deepcopy(train_conf)
     cv_conf['shuffle'] = False
+    cv_conf['spec_aug'] = False
+    cv_conf['speed_perturb'] = False
 
-    train_dataset = Dataset(args.train_data,
-                            train_conf,
-                            reverb_lmdb=args.reverb_lmdb,
-                            noise_lmdb=args.noise_lmdb)
+    train_dataset = Dataset(args.train_data, train_conf)
     cv_dataset = Dataset(args.cv_data, cv_conf)
 
-    train_data_loader = DataLoader(train_dataset,
-                                   batch_size=None,
-                                   pin_memory=args.pin_memory,
-                                   num_workers=args.num_workers,
-                                   prefetch_factor=args.prefetch)
-    cv_data_loader = DataLoader(cv_dataset,
-                                batch_size=None,
-                                pin_memory=args.pin_memory,
-                                num_workers=args.num_workers,
-                                prefetch_factor=args.prefetch)
-
-    # Write model_dir/config.yaml for inference and export
-    
-    if rank == 0:
-        saved_config_path = os.path.join(args.model_dir, 'config.yaml')
-        with open(saved_config_path, 'w') as fout:
-            data = yaml.dump(configs)
-            fout.write(data)
-
-    # Init asr model from configs
-    model = init_model(configs['model'])
-    print(model)
+    train_data_loader = DataLoader(train_dataset, batch_size=None, pin_memory=args.pin_memory,
+                                   num_workers=args.num_workers, prefetch_factor=args.prefetch)
+    cv_data_loader = DataLoader(cv_dataset, batch_size=None, pin_memory=args.pin_memory,
+                                num_workers=args.num_workers, prefetch_factor=args.prefetch)
+    input_dim = configs['dataset_conf']['feature_extraction_conf'][
+        'num_ceps']
+    output_dim = args.num_keywords
+    configs['model']['output_dim'] = output_dim
+    if 'input_dim' not in configs['model']:
+        configs['model']['input_dim'] = input_dim
+    # 모델 설정
+    model = BCResNets(int(configs['model']['tau']))
     num_params = count_parameters(model)
-    print('the number of model params: {}'.format(num_params))
+    logging.info(f"Model Parameters: {num_params}")
 
-    # !!!IMPORTANT!!!
-    # Try to export the model by script, if fails, we should refine
-    # the code to satisfy the script export requirements
-    executor = Executor()
-    # If specify checkpoint, load some info from checkpoint
-    if args.checkpoint is not None:
+    # Checkpoint 자동 로드
+    last_epoch, last_checkpoint = get_last_checkpoint(args.model_dir)
+    if args.checkpoint:
         infos = load_checkpoint(model, args.checkpoint)
+    elif last_checkpoint:
+        logging.info(f"Loading checkpoint: {last_checkpoint}")
+        infos = load_checkpoint(model, last_checkpoint)
+        start_epoch = last_epoch + 1
     else:
+        logging.info("No checkpoint found. Starting from scratch.")
         infos = {}
-    start_epoch = infos.get('epoch', -1) + 1
-    cv_loss = infos.get('cv_loss', 0.0)
-    # get the last epoch lr
-    lr_last_epoch = infos.get('lr', configs['optim_conf']['lr'])
-    configs['optim_conf']['lr'] = lr_last_epoch
+
+    start_epoch = infos.get('epoch', 0) + 1
+    num_epochs = configs['training_config'].get('max_epoch', 100)
+
+    train_losses = infos.get('train_losses', [])
+    cv_losses = infos.get('cv_losses', [])
+
+    # Optimizer & Scheduler 설정
+    # 🔥 Optimizer 선택 (SGD / Adam)
+    optim_type = configs['optim']
+    optim_conf = configs['optim_conf']
+
+    init_lr = optim_conf['init_lr']
+    lr_lower_limit = optim_conf['lr_lower_limit']
+    lr = optim_conf['lr']
+    weight_decay = optim_conf.get('weight_decay', 1e-3)
+    momentum = optim_conf.get('momentum', 0.9)
+    warmup_epochs = optim_conf.get('warmup_epochs', 5)
+    num_samples = get_data_list_length(args.train_data)
+    n_step_warmup = num_samples * warmup_epochs
+    total_iter = num_samples * num_epochs
+    iterations = 0
+
+    if optim_type.lower() == 'sgd':
+        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+    elif optim_type.lower() == 'adam':
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Unknown optimizer type: {optim_type}")
+
     model_dir = args.model_dir
     writer = None
     if rank == 0:
@@ -165,64 +191,75 @@ def main():
         writer = SummaryWriter(os.path.join(args.tensorboard_dir, exp_id))
 
     if world_size > 1:
-        assert (torch.cuda.is_available())
-        # cuda model is required for nn.parallel.DistributedDataParallel
+        assert torch.cuda.is_available()
         model.cuda()
         model = torch.nn.parallel.DistributedDataParallel(model)
         device = torch.device("cuda")
     else:
         use_cuda = gpu >= 0 and torch.cuda.is_available()
-        device = torch.device('cuda' if use_cuda else 'cpu')
+        device = torch.device(f'cuda:{gpu}' if use_cuda else 'cpu')
         model = model.to(device)
 
-    optimizer = optim.Adam(model.parameters(), **configs['optim_conf'])
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=0.5,
-        patience=3,
-        min_lr=1e-6,
-        threshold=0.01,
-    )
+    # 학습 루프
+    start_time = time.time()
+    cv_num_samples = get_data_list_length(args.cv_data)
+    for epoch in range(start_epoch, num_epochs + 1):
+        model.train()
+        logging.info(f"Epoch {epoch} TRAINING STARTED")
+        total_epoch_loss = []
+        for sample in tqdm(train_data_loader, desc="epoch %d, iters" % (epoch)):
+            # lr cos schedule
+            iterations += 1
+            if iterations < n_step_warmup:
+                lr = init_lr * iterations / n_step_warmup
+            else:
+                lr = lr_lower_limit + 0.5 * (init_lr - lr_lower_limit) * (1 + np.cos(np.pi * (iterations - n_step_warmup) / (total_iter - n_step_warmup)))
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
-    training_config = configs['training_config']
-    num_epochs = training_config.get('max_epoch', 100)
-    final_epoch = None
-    if start_epoch == 0 and rank == 0:
-        save_model_path = os.path.join(model_dir, 'init.pt')
-        save_checkpoint(model, save_model_path)
+            key, feats, target, _, _ = sample
+            feats, target = feats.to(device), target.to(device)    
+            outputs = model(feats)
+            train_loss = F.cross_entropy(outputs, target.long())
+            train_loss.backward()
+            optimizer.step()
+            model.zero_grad()
 
-    # Start training loop
-    for epoch in range(start_epoch, num_epochs):
-        train_dataset.set_epoch(epoch)
-        training_config['epoch'] = epoch
-        lr = optimizer.param_groups[0]['lr']
-        logging.info('Epoch {} TRAIN info lr {}'.format(epoch, lr))
-        executor.train(model, optimizer, train_data_loader, device, writer,
-                       training_config)
-        cv_loss = executor.cv(model, cv_data_loader, device,
-                                      training_config)
-        logging.info('Epoch {} CV info cv_loss {}'.format(
-            epoch, cv_loss))
+            total_epoch_loss.append(train_loss.item())
 
-        if rank == 0:
-            save_model_path = os.path.join(model_dir, '{}.pt'.format(epoch))
-            save_checkpoint(model, save_model_path, {
-                'epoch': epoch,
-                'lr': lr,
-                'cv_loss': cv_loss,
-            })
-            writer.add_scalar('epoch/cv_loss', cv_loss, epoch)
-            writer.add_scalar('epoch', epoch)
-            writer.add_scalar('epoch/lr', lr, epoch)
-        final_epoch = epoch
-        scheduler.step(cv_loss)
 
-    if final_epoch is not None and rank == 0:
-        final_model_path = os.path.join(model_dir, 'final.pt')
-        os.symlink('{}.pt'.format(final_epoch), final_model_path)
-        writer.close()
+        epoch_loss = sum(total_epoch_loss) / len(total_epoch_loss)
+        logging.info(f"Epoch Training Loss: {epoch_loss:.4f}")
+        logging.info("current lr check ... %.4f" % lr)
+        train_losses.append(epoch_loss)
 
+        total_cv_epoch_loss = []
+        with torch.no_grad():
+            model.eval()
+            true_count = 0.0
+            num_valid_set = float(cv_num_samples)
+            for key, feats, target, _, _ in cv_data_loader:
+                feats, target = feats.to(device), target.to(device)   
+                outputs = model(feats)
+                valid_loss = F.cross_entropy(outputs, target.long())
+                total_cv_epoch_loss.append(valid_loss.item())
+                prediction = torch.argmax(outputs, dim=-1) 
+                true_count += torch.sum(prediction == target).detach().cpu().numpy()
+            acc = true_count / num_valid_set * 100
+            valid_epoch_loss = sum(total_cv_epoch_loss) / len(total_cv_epoch_loss)
+            logging.info(f"Epoch Validation Loss: {valid_epoch_loss:.4f}, acc : {acc:.2f}")
+            cv_losses.append(valid_epoch_loss)
+        # Checkpoint 저장
+        save_checkpoint(model, os.path.join(args.model_dir, f"{epoch}.pt"), {
+            'epoch': epoch,
+            'train_losses': train_losses,
+            'cv_losses': cv_losses,
+        })
+
+        plot_loss_async(train_losses, cv_losses, args.model_dir)
+        display_epoch_progress(epoch, num_epochs, start_time)
+
+    logging.info("Training Finished.")
 
 if __name__ == '__main__':
     main()

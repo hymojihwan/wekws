@@ -9,6 +9,17 @@ from monet.model.show import show_params, show_model
 from monet.model.conv_stft import ConvSTFT, ConviSTFT 
 from monet.model.complexnn import ComplexConv2d, ComplexConvTranspose2d, NavieComplexLSTM, complex_cat, ComplexBatchNorm
 
+from asteroid.models import ConvTasNet
+
+
+class SEModel(nn.Module):
+    def __init__(self, num_sources=1, num_blocks=8, num_repeats=3):
+        super(SEModel, self).__init__()
+        self.model = ConvTasNet(n_src=num_sources, n_blocks=num_blocks, n_repeats=num_repeats)
+
+    def forward(self, noisy_waveform):
+        clean_waveform = self.model(noisy_waveform)  # (batch, 1, time)
+        return clean_waveform.squeeze(1)  # (batch, time)
 
 
 class DCCRN(nn.Module):
@@ -225,7 +236,7 @@ class DCCRN(nn.Module):
         out_wav = torch.squeeze(out_wav, 1)
         #out_wav = torch.tanh(out_wav)
         out_wav = torch.clamp_(out_wav,-1,1)
-        return out_wav
+        return out_wav, encoder_out
 
     def get_params(self, weight_decay=0.0):
             # add L2 penalty

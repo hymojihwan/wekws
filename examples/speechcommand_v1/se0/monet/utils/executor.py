@@ -45,7 +45,7 @@ class Executor:
                 continue
 
             # 모델 Forward Pass
-            enhanced_spec, enhanced_signal = model(noisy)
+            enhanced_signal = model(noisy)
 
             # 손실(loss) 계산
             loss = model.module.loss(enhanced_signal, target)
@@ -92,7 +92,7 @@ class Executor:
                 num_utts = noisy_lengths.size(0)
                 if num_utts == 0:
                     continue
-                enhanced_spec, enhanced_signal = model(noisy)
+                enhanced_signal = model(noisy)
                 loss = model.module.loss(enhanced_signal, target)
                 if torch.isfinite(loss):
                     num_seen_utts += num_utts

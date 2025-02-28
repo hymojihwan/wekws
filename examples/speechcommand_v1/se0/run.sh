@@ -1,26 +1,23 @@
 #!/bin/bash
-# Copyright 2021  Binbin Zhang
-#                 Jingyong Hou
 
 . ./path.sh
 
-stage=7
-stop_stage=7
+stage=1
+stop_stage=1
 num_keywords=11
 
-config=conf/dccrn.yaml
+config=../../librispeech_100/se0/conf/convtasnet.yaml
 
 gpus="0,1,2,3"
 
 checkpoint=
-dir=exp/dccrn
-
+dir=exp/convtasnet
 num_average=10
 score_checkpoint=$dir/avg_${num_average}
 
 # your data dir
 download_dir=/home/user/Workspace/wekws/examples/speechcommand_v1/s0/data/local
-speech_command_dir=$download_dir/speech_commands_v1
+speech_command_dir=$download_dir/speech_commands_v1/convtas
 noise_dir=/home/user/Workspace/MS-SNSD
 musan_noise_dir=/DB/musan
 
@@ -81,7 +78,6 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
     --cv_data data/noisy_valid/data.list \
     --model_dir $dir \
     --num_workers 8 \
-    --num_keywords $num_keywords \
     --min_duration 50 \
     ${checkpoint:+--checkpoint $checkpoint}
 fi
@@ -100,7 +96,7 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
   python monet/bin/test.py \
     --config $dir/config.yaml \
     --checkpoint $dir/10best_avg.pt \
-    --test_data data/test/data.list \
+    --test_data data/noisy_test/data.list \
     --output_dir $result_dir
 fi
 
@@ -171,6 +167,43 @@ if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
   python monet/bin/test.py \
     --config $dir/config.yaml \
     --checkpoint $dir/10best_avg.pt \
-    --test_data data/speech_noisy_test/data.list \
+    --test_data data/noise_noisy_test/data.list \
     --output_dir $result_dir
+fi
+
+
+if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
+  echo "Stage 8 : Make enhanced wav file using SE model ..."
+  # Testing
+  # for x in noisy_test noise_noisy_test music_noisy_test speech_noisy_test; do
+  result_dir=$dir/test_$(basename $score_checkpoint)
+  mkdir -p $result_dir
+  for x in noisy_test noise_noisy_test music_noisy_test speech_noisy_test; do
+    enhanced_noisy_data_dir=$speech_command_dir/enhanced_${x}
+    mkdir -p $enhanced_noisy_data_dir
+    python monet/bin/enhance.py \
+      --config $dir/config.yaml \
+      --checkpoint $dir/10best_avg.pt \
+      --test_data data/${x}/data.list \
+      --output_dir $enhanced_noisy_data_dir \
+      --noisy_data $x 
+  done
+fi
+
+if [ ${stage} -le 9 ] && [ ${stop_stage} -ge 9 ]; then
+  echo "Stage 9 : Make enhanced wav file using SE model ..."
+  # Testing
+  # for x in noisy_test noise_noisy_test music_noisy_test speech_noisy_test; do
+  result_dir=$dir/test_$(basename $score_checkpoint)
+  mkdir -p $result_dir
+  for x in noisy_train; do
+    enhanced_noisy_data_dir=$speech_command_dir/enhanced_${x}
+    mkdir -p $enhanced_noisy_data_dir
+    python monet/bin/enhance.py \
+      --config $dir/config.yaml \
+      --checkpoint $dir/10best_avg.pt \
+      --test_data data/${x}/data.list \
+      --output_dir $enhanced_noisy_data_dir \
+      --noisy_data $x 
+  done
 fi

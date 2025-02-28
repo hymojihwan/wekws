@@ -1,3 +1,5 @@
+# Pre-trained SE model & KWS model just load and inference
+
 import os
 import logging
 import argparse
@@ -6,6 +8,8 @@ import torch
 import torch.nn.functional as F
 import json
 import torchaudio
+
+import time
 import yaml
 import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
@@ -80,32 +84,34 @@ def acc_kws(logits, target):
     return correct  # 🔥 배치 크기 고려
 
 
-
 def test_se_kws(kws_model, test_data_loader, device):
-    """ Evaluate SE + KWS Model and compare accuracy on Noisy vs Enhanced Speech """
+    """ Evaluate SE + KWS Model and measure latency """
 
     kws_model.eval()
     total_correct = 0
     total_samples = 0
-    
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(test_data_loader):
             batch_keys, batch_feats, batch_targets, _, _ = batch
-            # print("feats : ", batch_feats.size())
             batch_feats = batch_feats.to(device)  # KWS 입력
             batch_targets = batch_targets.to(device)  # 정답 라벨
-            
-            # 🔥 KWS 모델 예측 수행
-            logits, _ = kws_model.forward(batch_feats)
+
+            # 🔥 Latency 측정 시작
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+
+            logits, _ = kws_model.forward(batch_feats)  # ✅ KWS 모델 추론 수행
+
+            # 🔥 Latency 측정 종료
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
             
             total_correct += acc_kws(logits, batch_targets)
-            
             total_samples += len(batch_targets)
 
     # 🔥 Final Accuracy Calculation
     avg_acc = (total_correct / total_samples) * 100
 
-    return avg_acc
+    return avg_acc, total_samples
 
 def main():
     args = get_args()
@@ -141,6 +147,7 @@ def main():
     test_conf['feature_extraction_conf']['dither'] = 0.0
     test_conf['batch_conf']['batch_size'] = args.batch_size
 
+    start_time = time.time()
     # Load test data
     test_dataset = Dataset(args.test_data, se_model, test_conf)
     test_data_loader = DataLoader(test_dataset,
@@ -149,16 +156,20 @@ def main():
                                 num_workers=args.num_workers)
 
     # Run evaluation
-    test_results = test_se_kws(kws_model, test_data_loader, device)
-
+    test_results, total_samples = test_se_kws(kws_model, test_data_loader, device)
+    end_time = time.time()
+    avg_latency = (end_time - start_time) * 1000  # ms 단위 변환
+    avg_latency = avg_latency / total_samples
     # Log final results
     logging.info(f"🚀 Final Accuracy Results 🚀")
-    logging.info(f"Noisy Speech Accuracy: {test_results:.2f}%")  # ✅ 수정
+    logging.info(f"Noisy Speech Accuracy: {test_results:.2f}%")
+    logging.info(f"Average Latency per Batch: {avg_latency:.2f} ms")  # ✅ 추가
+
     # Save final results
     os.makedirs(args.output_dir, exist_ok=True)
     results_path = os.path.join(args.output_dir, "results.txt")
     with open(results_path, "w") as f:
-        f.write(json.dumps(test_results, indent=4))
+        json.dump({"accuracy": test_results, "avg_latency_ms": avg_latency}, f, indent=4)
 
     logging.info(f"Results saved to {results_path}")
 

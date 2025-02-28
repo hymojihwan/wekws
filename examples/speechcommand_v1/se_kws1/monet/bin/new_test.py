@@ -9,7 +9,7 @@ import yaml
 from torchmetrics.audio import SignalDistortionRatio
 from pesq import pesq
 from pystoi import stoi
-from monet.model.se_model import init_model
+from monet.model.se_kws_model import SEKWSModel
 from monet.utils.checkpoint import load_checkpoint
 
 def get_args():
@@ -18,10 +18,19 @@ def get_args():
     parser.add_argument("--checkpoint", required=True, help="Path to the trained model checkpoint")
     parser.add_argument("--test_data", required=True, help="Path to the directory containing test data")
     parser.add_argument("--output_dir", default="results", help="Directory to save enhanced audio")
-    parser.add_argument("--metrics", nargs="+", default=["SDR", "SI-SNR"], help="Metrics to evaluate")
     parser.add_argument("--log_file", default="test.log", help="File to save the test log")
     args = parser.parse_args()
     return args
+
+def acc_frame(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+):
+    if logits is None:
+        return 0
+    pred = logits.max(1, keepdim=True)[1]
+    correct = pred.eq(target.long().view_as(pred)).sum().item()
+    return correct * 100.0 / logits.size(0)
 
 
 def get_new_log_file(log_file):
@@ -54,33 +63,6 @@ def setup_logging(log_file):
     )
     logging.info(f"✅ Logging to {log_file}")
 
-def evaluate_metrics(clean, enhanced, sample_rate, metrics):
-    results = {}
-    if "SDR" in metrics:
-        sdr_metric = SignalDistortionRatio()
-        results["SDR"] = sdr_metric(enhanced, clean).item()
-    if "SI-SNR" in metrics:
-        si_snr_value = si_snr(enhanced, clean)
-        results["SI-SNR"] = si_snr_value.item()
-    if "PESQ" in metrics:
-        pesq_score = pesq(sample_rate, clean.squeeze().numpy(), enhanced.squeeze().numpy(), "nb")
-        results["PESQ"] = pesq_score
-    if "STOI" in metrics:
-        stoi_score = stoi(clean.squeeze().numpy(), enhanced.squeeze().numpy(), sample_rate, extended=False)
-        results["STOI"] = stoi_score
-    return results
-
-
-def si_snr(predicted, target, eps=1e-8):
-    """
-    Compute Scale-Invariant Signal-to-Noise Ratio (SI-SNR).
-    """
-    target_norm = torch.sum(target * predicted, dim=-1, keepdim=True) / (torch.sum(target ** 2, dim=-1, keepdim=True) + eps)
-    target_proj = target_norm * target
-    noise = predicted - target_proj
-    si_snr_value = 10 * torch.log10((torch.sum(target_proj ** 2, dim=-1) + eps) / (torch.sum(noise ** 2, dim=-1) + eps))
-    return torch.mean(si_snr_value)
-
 def load_test_data(test_data_path):
     """
     Load test data from a JSON-formatted list file.
@@ -111,7 +93,7 @@ def main():
         configs = yaml.load(f, Loader=yaml.FullLoader)
 
     # Initialize model
-    model = init_model(configs["model"])
+    model = SEKWSModel(configs['se_model'], configs['kws_model'])
     model.eval()
 
     # Load trained checkpoint
@@ -123,16 +105,14 @@ def main():
 
     # Load test data (Modified)
     test_data = load_test_data(args.test_data)
-    results = []
-
-    # Metric lists for averaging
-    sdr_list = []
-    si_snr_list = []
+    total_correct = 0
+    total_samples = 0
 
     for entry in test_data:
         test_key = entry["key"]
         clean_path = entry["clean"]
         noisy_path = entry["noisy"]
+        label = entry['txt']
 
         # Load noisy and clean signals
         noisy_signal, sample_rate = torchaudio.load(noisy_path)
@@ -140,33 +120,18 @@ def main():
 
         # Forward pass through the model
         with torch.no_grad():
-            enhanced_signal = model(noisy_signal)
+            enhanced_signal = model.se_model(noisy_signal)
+            enhanced_spec = model.spec_transform(enhanced_signal)
+            logits, _ = model.kws_model(enhanced_spec.permute(0, 2, 1))
             
-        # Save enhanced audio
-        # enhanced_path = os.path.join(args.output_dir, f"enhanced_{test_key}.wav")
-        # torchaudio.save(enhanced_path, enhanced_signal, sample_rate)
+            target = torch.tensor(label).long()  # ✅ 정수 변환
+            total_correct += acc_frame(logits, target)
+            total_samples += 1
 
-        # Compute metrics
-        min_length = min(clean_signal.shape[-1], enhanced_signal.shape[-1])
-        clean_signal = clean_signal[..., :min_length]
-        enhanced_signal = enhanced_signal[..., :min_length]
-        metric_results = evaluate_metrics(clean_signal, enhanced_signal, sample_rate, args.metrics)
-        
-        # logging.info(f"File: {test_key}, Metrics: {metric_results}")
-        results.append((test_key, metric_results))
-
-        # Store SDR and SI-SNR for averaging
-        if "SDR" in metric_results:
-            sdr_list.append(metric_results["SDR"])
-        if "SI-SNR" in metric_results:
-            si_snr_list.append(metric_results["SI-SNR"])
-
-    # Calculate average metrics
-    avg_sdr = sum(sdr_list) / len(sdr_list) if sdr_list else None
-    avg_si_snr = sum(si_snr_list) / len(si_snr_list) if si_snr_list else None
+    avg_acc = (total_correct / total_samples)
 
     # Log and save overall results
-    logging.info(f"Average SDR: {avg_sdr:.4f}, Average SI-SNR: {avg_si_snr:.4f}")
+    logging.info(f"Acc: {avg_acc:.2f}")
 
     # # Save overall results
     # results_path = os.path.join(args.output_dir, "results.txt")

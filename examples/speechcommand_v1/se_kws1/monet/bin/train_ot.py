@@ -1,16 +1,3 @@
-# Copyright (c) 2020 Binbin Zhang
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import print_function
 
@@ -33,10 +20,9 @@ import yaml
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 
-from monet.model.se_model import init_model
+from monet.model.se_kws_ot_model import SEKWSModel
 from monet.utils.file_utils import setup_logging
 from monet.utils.train_utils import count_parameters, set_mannul_seed, get_last_checkpoint, display_epoch_progress
-from monet.utils.executor import Executor
 from monet.utils.checkpoint import load_checkpoint, save_checkpoint
 from monet.dataset.dataset import Dataset
 
@@ -44,7 +30,7 @@ from monet.dataset.dataset import Dataset
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description='training your network')
+    parser = argparse.ArgumentParser(description='Joint Training for SE + KWS')
     parser.add_argument('--config', required=True, help='config file')
     parser.add_argument('--train_data', required=True, help='train data file')
     parser.add_argument('--cv_data', required=True, help='cv data file')
@@ -75,6 +61,10 @@ def get_args():
                         action='store_true',
                         default=False,
                         help='norm var option')
+    parser.add_argument('--num_keywords',
+                        default=1,
+                        type=int,
+                        help='number of keywords')
     parser.add_argument('--min_duration',
                         default=50,
                         type=int,
@@ -93,7 +83,7 @@ def get_args():
     args = parser.parse_args()
     return args
 
-def save_loss_plot(train_losses, cv_losses, model_dir):
+def save_loss_plot(train_losses, cv_losses, model_dir, tag=""):
     plt.figure(figsize=(10, 5))
     plt.plot(train_losses, label="Train")
     plt.plot(cv_losses, label="Valid")
@@ -102,12 +92,72 @@ def save_loss_plot(train_losses, cv_losses, model_dir):
     plt.title("Loss Curve")
     plt.legend()
     plt.grid(True)
-    plt.savefig(f"{model_dir}/loss.png")
+    plt.savefig(f"{model_dir}/{tag}_loss.png")
     plt.close()
 
-def plot_loss_async(train_losses, cv_losses, model_dir):
-    p = multiprocessing.Process(target=save_loss_plot, args=(train_losses, cv_losses, model_dir))
+def plot_loss_async(train_losses, cv_losses, model_dir, tag=""):
+    p = multiprocessing.Process(target=save_loss_plot, args=(train_losses, cv_losses, model_dir, tag))
     p.start()
+
+def train(model, train_data_loader, optimizer, device):
+    model.train()
+    total_loss_epoch = []
+    total_se_loss_epoch = []
+    total_kws_loss_epoch = []
+    total_ot_loss_epoch = []
+
+    for batch_idx, batch in enumerate(train_data_loader):
+        key, noisy, clean, target = batch 
+        clean, noisy, target = clean.to(device), noisy.to(device), target.to(device)
+
+        # Forward Pass
+        loss, logits, se_loss, kws_loss, ot_loss = model(noisy, clean, target)
+
+        # Backward & Optimize
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss_epoch.append(loss.item())
+        total_se_loss_epoch.append(se_loss.item())
+        total_kws_loss_epoch.append(kws_loss.item())
+        total_ot_loss_epoch.append(ot_loss.item())
+
+    epoch_loss = sum(total_loss_epoch) / len(total_loss_epoch)
+    epoch_se_loss = sum(total_se_loss_epoch) / len(total_se_loss_epoch)
+    epoch_kws_loss = sum(total_kws_loss_epoch) / len(total_kws_loss_epoch)
+    epoch_ot_loss = sum(total_ot_loss_epoch) / len(total_ot_loss_epoch)
+    logging.info(f"Epoch Training Loss: {epoch_loss:.4f}, SE Loss: {epoch_se_loss:.4f}, KWS_Loss: {epoch_kws_loss:.4f}, OT_Loss: {epoch_ot_loss:.4f}")
+
+    return epoch_loss, epoch_se_loss, epoch_kws_loss, epoch_ot_loss
+
+def cv(model, dataloader, device):
+    """
+    모델 검증 함수
+    """
+    model.eval()
+    val_loss_epoch = []
+    total_se_loss_epoch = []
+    total_kws_loss_epoch = []
+    total_ot_loss_epoch = []
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            key, noisy, clean, target = batch 
+            clean, noisy, target = clean.to(device), noisy.to(device), target.to(device)
+
+            loss, logits, se_loss, kws_loss, ot_loss = model(noisy, clean, target)
+            val_loss_epoch.append(loss.item())
+            total_se_loss_epoch.append(se_loss.item())
+            total_kws_loss_epoch.append(kws_loss.item())
+            total_ot_loss_epoch.append(ot_loss.item())
+
+    val_loss = sum(val_loss_epoch) / len(val_loss_epoch)
+    epoch_se_loss = sum(total_se_loss_epoch) / len(total_se_loss_epoch)
+    epoch_kws_loss = sum(total_kws_loss_epoch) / len(total_kws_loss_epoch)
+    epoch_ot_loss = sum(total_ot_loss_epoch) / len(total_ot_loss_epoch)
+    logging.info(f"Validation Loss: {val_loss:.4f}")
+    return val_loss, epoch_se_loss, epoch_kws_loss, epoch_ot_loss
 
 def main():
     args = get_args()
@@ -150,17 +200,29 @@ def main():
                                 num_workers=args.num_workers,
                                 prefetch_factor=args.prefetch)
 
-    # Write model_dir/config.yaml for inference and export
     
+    
+    input_dim = configs['dataset_conf']['feature_extraction_conf'][
+        'num_mel_bins']
+    output_dim = args.num_keywords
+
+    # Write model_dir/config.yaml for inference and export
+    if 'input_dim' not in configs['kws_model']:
+        configs['kws_model']['input_dim'] = input_dim
+    configs['kws_model']['output_dim'] = output_dim
+    if args.cmvn_file is not None:
+        configs['kws_model']['cmvn'] = {}
+        configs['kws_model']['cmvn']['norm_var'] = args.norm_var
+        configs['kws_model']['cmvn']['cmvn_file'] = args.cmvn_file
+
+
     if rank == 0:
         logging.info("Training config : {}".format(args))
-        saved_config_path = os.path.join(args.model_dir, 'config.yaml')
-        with open(saved_config_path, 'w') as fout:
-            data = yaml.dump(configs)
-            fout.write(data)
+        with open(os.path.join(args.model_dir, 'config.yaml'), 'w') as fout:
+            yaml.dump(configs, fout)
 
     # Init asr model from configs
-    model = init_model(configs['model'])
+    model = SEKWSModel(configs['se_model'], configs['kws_model'])
     num_params = count_parameters(model)
     if rank == 0:
         logging.info("Model structure:")
@@ -170,7 +232,6 @@ def main():
     # !!!IMPORTANT!!!
     # Try to export the model by script, if fails, we should refine
     # the code to satisfy the script export requirements
-    executor = Executor()
     # If specify checkpoint, load some info from checkpoint
 
     # Automatically find last checkpoint
@@ -186,8 +247,14 @@ def main():
         infos = {}
 
     start_epoch = infos.get('epoch', 0) + 1
-    train_losses = infos.get('train_losses', [])  
+    train_losses = infos.get('train_losses', [])
+    train_se_losses = infos.get('train_se_losses', [])  
+    train_kws_losses = infos.get('train_kws_losses', [])  
+    train_ot_losses = infos.get('train_ot_losses', [])  
     cv_losses = infos.get('cv_losses', [])  
+    cv_se_losses = infos.get('cv_se_losses', [])  
+    cv_kws_losses = infos.get('cv_kws_losses', [])  
+    cv_ot_losses = infos.get('cv_ot_losses', [])  
     # get the last epoch lr
     lr_last_epoch = infos.get('lr', configs['optim_conf']['lr'])
     configs['optim_conf']['lr'] = lr_last_epoch
@@ -203,7 +270,7 @@ def main():
         assert (torch.cuda.is_available())
         # cuda model is required for nn.parallel.DistributedDataParallel
         model.cuda()
-        model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
+        model = torch.nn.parallel.DistributedDataParallel(model)
         device = torch.device("cuda")
     else:
         use_cuda = gpu >= 0 and torch.cuda.is_available()
@@ -234,15 +301,18 @@ def main():
         training_config['epoch'] = epoch
         lr = optimizer.param_groups[0]['lr']
         logging.info('Epoch {} TRAIN info lr {}'.format(epoch, lr))
-        train_loss = executor.train(model, optimizer, train_data_loader, device, writer,
-                       training_config)
+        
+        train_loss, train_se_loss, train_kws_loss, train_ot_loss = train(model, train_data_loader, optimizer, device)
         train_losses.append(train_loss)
-    
-        cv_loss = executor.cv(model, cv_data_loader, device,
-                                      training_config)
+        train_se_losses.append(train_se_loss)
+        train_kws_losses.append(train_kws_loss)
+        train_ot_losses.append(train_ot_loss)
+
+        cv_loss, cv_se_loss, cv_kws_loss, cv_ot_loss = cv(model, cv_data_loader, device)
         cv_losses.append(cv_loss)
-        logging.info('Epoch {} CV info cv_loss {}'.format(
-            epoch, cv_loss))
+        cv_se_losses.append(cv_se_loss)
+        cv_kws_losses.append(cv_kws_loss)
+        cv_ot_losses.append(cv_ot_loss)
 
         if rank == 0:
             save_model_path = os.path.join(model_dir, '{}.pt'.format(epoch))
@@ -251,12 +321,21 @@ def main():
                 'lr': lr,
                 'cv_loss': cv_loss,
                 'train_losses': train_losses,
-                'cv_losses': cv_losses
+                'cv_losses': cv_losses,
+                'train_se_losses': train_se_losses,
+                'train_kws_losses': train_kws_losses,
+                'train_ot_losses': train_ot_losses,
+                'cv_se_losses': cv_se_losses,
+                'cv_kws_losses': cv_kws_losses,
+                'cv_ot_losses': cv_ot_losses,
             })
             logging.info(f"Model saved: {save_model_path}")
 
-            writer.add_scalars('Loss', {'Train': train_loss, 'Valid': cv_loss}, epoch)
+            writer.add_scalars('Loss', {'Train': train_loss, 'Train SE': train_se_loss, 'Train KWS': train_kws_loss, 'Train OT': train_ot_loss, 'Valid': cv_loss}, epoch)
             plot_loss_async(train_losses, cv_losses, model_dir)
+            plot_loss_async(train_se_losses, cv_se_losses, model_dir, "se")
+            plot_loss_async(train_kws_losses, cv_kws_losses, model_dir, "kws")
+            plot_loss_async(train_ot_losses, cv_ot_losses, model_dir, "ot")
             display_epoch_progress(epoch, num_epochs, start_time)
 
     
@@ -271,7 +350,6 @@ def main():
 
     logging.info("Training Finished.")
         
-
 
 if __name__ == '__main__':
     main()

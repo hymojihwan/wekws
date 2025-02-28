@@ -1,5 +1,6 @@
 import os
 import logging
+import random
 import argparse
 import torch
 import torch.distributed as dist
@@ -100,100 +101,18 @@ class DataList(IterableDataset):
             data.update(sampler_info)
             yield data
 
-
-class SEKWS_DataList(DataList):
-    """
-    SE 모델을 적용한 후 KWS 모델용 데이터로 변환하는 DataList
-    """
-    def __init__(self, lists, se_model, shuffle=True, partition=True):
-        super().__init__(lists, shuffle, partition)
-        self.se_model = se_model
-
-    def __iter__(self):
-        sampler_info = self.sampler.update()
-        lists = self.sampler.sample(self.lists)
-
-        for src in lists:
-            try:
-                json_line = json.loads(src)
-                assert 'key' in json_line and 'wav' in json_line and 'txt' in json_line
-
-                key = json_line['key']
-                wav_path = json_line['wav']
-                label = json_line['txt']
-
-                # 🔥 Noisy Speech Load (CPU에서 실행)
-                noisy_signal, sr = torchaudio.load(wav_path)
-
-                # 🔥 SE 모델 적용 (GPU에서만 실행)
-                with torch.no_grad():
-                    if torch.cuda.is_available():
-                        device = torch.device("cuda")
-                        noisy_signal = noisy_signal.to(device)
-                        se_model = self.se_model.to(device)
-                    else:
-                        device = torch.device("cpu")
-                        se_model = self.se_model.to(device)
-
-                    # _, enhanced_signal = self.se_model(noisy_signal)
-                    enhanced_signal = self.se_model(noisy_signal)
-                
-                # 🔥 JSON 대신 Tensor 자체를 넘김
-                yield {
-                    "key": key,
-                    "wav": enhanced_signal.cpu(),  # 🔥 바로 텐서로 넘김
-                    "sample_rate": sr,
-                    "txt": label
-                }
-
-            except Exception as e:
-                logging.warning(f"Skipping invalid data: {src} ({str(e)})")
-
-def Dataset(test_data, se_model, conf, reverb_lmdb=None, noise_lmdb=None):
+def Dataset(test_data, conf, reverb_lmdb=None, noise_lmdb=None):
     lists = read_lists(test_data)
 
     # 🔥 기존 DataList를 확장하여 SE 모델 적용 후 KWS 데이터 생성
     shuffle = conf.get('shuffle', True)
-    dataset = SEKWS_DataList(lists, se_model, shuffle=shuffle, partition=True)
+    dataset = DataList(lists, shuffle=shuffle, partition=True)
     dataset = Processor(dataset, processor.parse_raw)
     filter_conf = conf.get('filter_conf', {})
     dataset = Processor(dataset, processor.filter, **filter_conf)
 
     resample_conf = conf.get('resample_conf', {})
     dataset = Processor(dataset, processor.resample, **resample_conf)
-
-    speed_perturb = conf.get('speed_perturb', False)
-    if speed_perturb:
-        dataset = Processor(dataset, processor.speed_perturb)
-    if reverb_lmdb and conf.get('reverb_prob', 0) > 0:
-        reverb_data = LmdbData(reverb_lmdb)
-        dataset = Processor(dataset, processor.add_reverb,
-                            reverb_data, conf['reverb_prob'])
-    if noise_lmdb and conf.get('noise_prob', 0) > 0:
-        noise_data = LmdbData(noise_lmdb)
-        dataset = Processor(dataset, processor.add_noise,
-                            noise_data, conf['noise_prob'])
-    feature_extraction_conf = conf.get('feature_extraction_conf', {})
-    if feature_extraction_conf['feature_type'] == 'mfcc':
-        dataset = Processor(dataset, processor.compute_mfcc,
-                            **feature_extraction_conf)
-    elif feature_extraction_conf['feature_type'] == 'fbank':
-        dataset = Processor(dataset, processor.compute_fbank,
-                            **feature_extraction_conf)
-    spec_aug = conf.get('spec_aug', True)
-    if spec_aug:
-        spec_aug_conf = conf.get('spec_aug_conf', {})
-        dataset = Processor(dataset, processor.spec_aug, **spec_aug_conf)
-
-    context_expansion = conf.get('context_expansion', False)
-    if context_expansion:
-        context_expansion_conf = conf.get('context_expansion_conf', {})
-        dataset = Processor(dataset, processor.context_expansion,
-                            **context_expansion_conf)
-
-    frame_skip = conf.get('frame_skip', 1)
-    if frame_skip > 1:
-        dataset = Processor(dataset, processor.frame_skip, frame_skip)
 
     if shuffle:
         shuffle_conf = conf.get('shuffle_conf', {})
@@ -202,4 +121,5 @@ def Dataset(test_data, se_model, conf, reverb_lmdb=None, noise_lmdb=None):
     batch_conf = conf.get('batch_conf', {})
     dataset = Processor(dataset, processor.batch, **batch_conf)
     dataset = Processor(dataset, processor.padding)
+    # dataset = Processor(dataset, processor.padding_sample)
     return dataset

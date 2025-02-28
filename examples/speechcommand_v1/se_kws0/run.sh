@@ -10,8 +10,8 @@ num_keywords=11
 
 gpus="0,1,2,3"
 
-kws_dir=../s0/exp/ds_tcn
-se_dir=../se0/exp/dccrn
+kws_dir=../s0/exp/mdtc
+se_dir=../se0/exp/convtasnet
 
 kws_config=$kws_dir/config.yaml
 se_config=$se_dir/config.yaml
@@ -23,9 +23,9 @@ num_average=10
 
 # your data dir
 indomain_noisy_dir=../se0/data/noisy_test
-noisy_dir=../s0/data/
+noisy_dir=data
 
-result_dir=exp/se_dccrn_kws_ds_tcn
+result_dir=exp/convtasnet_based_enhanced_speechcommand_se_convtasnet_kws_mdtc
 
 . tools/parse_options.sh || exit 1;
 
@@ -37,7 +37,8 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
   # for x in noisy_test noise_noisy_test music_noisy_test speech_noisy_test; do
   mkdir -p $result_dir
 
-  for x in noise_noisy_test music_noisy_test speech_noisy_test noisy_test;
+  for x in test noise_noisy_test music_noisy_test speech_noisy_test noisy_test;
+  # for x in test;
   do
     test_dir=$result_dir/${x}
     mkdir -p $test_dir

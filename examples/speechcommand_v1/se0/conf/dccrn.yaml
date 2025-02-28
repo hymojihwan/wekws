@@ -3,7 +3,7 @@ dataset_conf:
     shuffle_conf:
         shuffle_size: 1500
     batch_conf:
-        batch_size: 512
+        batch_size: 128
 
 model:
     n_fft: 512

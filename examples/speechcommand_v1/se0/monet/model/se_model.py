@@ -17,11 +17,13 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from monet.model.dccrn import DCCRN
+from monet.model.convtasnet import SEModel
+# from monet.model.dccrn import DCCRN
 
 def init_model(configs):
     
-    se_model = DCCRN(configs)
+    se_model = SEModel(configs)
+    # se_model = DCCRN(configs)
 
     return se_model
 

@@ -285,6 +285,66 @@ def batch(data, batch_size=16):
         yield buf
 
 
+# def padding(data):
+#     """ Padding the data into training data
+
+#         Args:
+#             data: Iterable[List[{key, clean, noisy}]]
+
+#         Returns:
+#             Iterable[Tuple(keys, feats, labels, feats lengths, label lengths)]
+#     """
+    
+#     for sample in data:
+#         assert isinstance(sample, list)
+#         noisy_length = torch.tensor([x['noisy'].size(0) for x in sample],
+#                                     dtype=torch.int32)
+        
+#         order = torch.argsort(noisy_length, descending=True)
+#         noisy_lengths = torch.tensor(
+#             [sample[i]['noisy'].size(0) for i in order], dtype=torch.int32)
+#         clean_length = torch.tensor([x['clean'].size(0) for x in sample],
+#                                     dtype=torch.int32)
+#         order_clean = torch.argsort(clean_length, descending=True)
+#         clean_lengths = torch.tensor(
+#             [sample[i]['clean'].size(0) for i in order_clean], dtype=torch.int32)
+#         sorted_noisy = [sample[i]['noisy'] for i in order]
+#         sorted_keys = [sample[i]['key'] for i in order]
+#         sorted_clean = [sample[i]['clean'] for i in order_clean]
+#         sorted_noisy = extend_list(sorted_noisy)
+#         padded_noisy = pad_sequence(sorted_noisy,
+#                                     batch_first=True,
+#                                     padding_value=0)
+#         sorted_clean = extend_list(sorted_clean)
+#         padded_clean = pad_sequence(sorted_clean,
+#                                     batch_first=True,
+#                                     padding_value=0)
+#         yield (sorted_keys, padded_noisy, padded_clean, noisy_lengths, clean_lengths)
+
+def extend_list(lst):
+    """
+    길이가 16000보다 짧으면 반복해서 늘리고, 길면 잘라서 16000으로 맞춤.
+    """
+    sample_rate = 16000
+    new_list = []
+
+    for sample in lst:
+        length = sample.size(-1)
+
+        if length > sample_rate:
+            # 너무 긴 경우 잘라서 맞춤
+            new_sample = sample[:, :sample_rate]
+        elif length < sample_rate:
+            # 너무 짧은 경우 반복해서 확장
+            repeat_factor = (sample_rate // length) + 1  # 필요한 반복 횟수 계산
+            new_sample = sample.repeat(1, repeat_factor)[:, :sample_rate]  # 자르면서 확장
+        else:
+            new_sample = sample  # 이미 16000이면 그대로 유지
+        
+        new_list.append(new_sample)
+    
+    return new_list
+
 def padding(data):
     """ Padding the data into training data
 
@@ -294,48 +354,85 @@ def padding(data):
         Returns:
             Iterable[Tuple(keys, feats, labels, feats lengths, label lengths)]
     """
-    
     for sample in data:
         assert isinstance(sample, list)
-        noisy_length = torch.tensor([x['noisy'].size(0) for x in sample],
-                                    dtype=torch.int32)
-        
-        order = torch.argsort(noisy_length, descending=True)
-        noisy_lengths = torch.tensor(
-            [sample[i]['noisy'].size(0) for i in order], dtype=torch.int32)
-        clean_length = torch.tensor([x['clean'].size(0) for x in sample],
-                                    dtype=torch.int32)
-        order_clean = torch.argsort(clean_length, descending=True)
-        clean_lengths = torch.tensor(
-            [sample[i]['clean'].size(0) for i in order_clean], dtype=torch.int32)
-        sorted_noisy = [sample[i]['noisy'] for i in order]
-        sorted_keys = [sample[i]['key'] for i in order]
-        sorted_clean = [sample[i]['clean'] for i in order_clean]
-        sorted_noisy = extend_list(sorted_noisy)
-        padded_noisy = pad_sequence(sorted_noisy,
-                                    batch_first=True,
-                                    padding_value=0)
-        sorted_clean = extend_list(sorted_clean)
-        padded_clean = pad_sequence(sorted_clean,
-                                    batch_first=True,
-                                    padding_value=0)
-        yield (sorted_keys, padded_noisy, padded_clean, noisy_lengths, clean_lengths)
 
-def extend_list(list):
-    sample_rate = 16000
-    new_list = []
-    for sample in list:
-        if sample.size(-1) != sample_rate:
-            # new_sample = sample
-            new_sample = torch.cat([sample, sample[:, :sample_rate-sample.size(-1)]], dim=-1)
-            for i in range(0, int(sample_rate / sample.size(-1)) -1):
-                new_sample = torch.cat([new_sample, new_sample[:, :sample_rate-new_sample.size(-1)]], dim=-1)
-            new_list.append(new_sample)
-        else:
-            new_list.append(sample)
-        del sample
+        # 각 데이터의 길이 확인
+        noisy_lengths = torch.tensor([x['noisy'].size(0) for x in sample], dtype=torch.int32)
+        clean_lengths = torch.tensor([x['clean'].size(0) for x in sample], dtype=torch.int32)
+
+        # noisy 데이터 길이 기준으로 정렬
+        order = torch.argsort(noisy_lengths, descending=True)
+        sorted_noisy = [sample[i]['noisy'] for i in order]
+        sorted_clean = [sample[i]['clean'] for i in order]
+        sorted_keys = [sample[i]['key'] for i in order]
+
+        # 동일한 랜덤 구간 선택 후 noisy, clean에 적용
+        processed_noisy, processed_clean = [], []
+        for noisy, clean in zip(sorted_noisy, sorted_clean):
+            noisy_processed, clean_processed = process_pair(noisy, clean)
+            processed_noisy.append(noisy_processed)
+            processed_clean.append(clean_processed)
+        
+        # Zero-padding을 적용한 결과를 배치로 반환
+        padded_noisy = pad_sequence(processed_noisy, batch_first=True, padding_value=0)
+        padded_clean = pad_sequence(processed_clean, batch_first=True, padding_value=0)
+
+        yield (sorted_keys, padded_noisy, padded_clean, noisy_lengths, clean_lengths)
+        
+def process_pair(noisy_waveform, clean_waveform, sample_rate=16000):
+    """
+    noisy와 clean 데이터를 동일한 구간으로 자르거나 패딩.
+
+    Args:
+        noisy_waveform (Tensor): (channels, time) 형태의 noisy 데이터
+        clean_waveform (Tensor): (channels, time) 형태의 clean 데이터
+        sample_rate (int): 샘플레이트 (기본값: 16000)
+
+    Returns:
+        Tuple(Tensor, Tensor): 동일한 구간으로 자른 noisy와 clean 데이터
+    """
+    FIXED_LENGTH = sample_rate * 1  # 4초 = 64000 샘플
+
+    # 차원 확인 및 조정 (1D → 2D)
+    if noisy_waveform.dim() == 1:
+        noisy_waveform = noisy_waveform.unsqueeze(0)
+    if clean_waveform.dim() == 1:
+        clean_waveform = clean_waveform.unsqueeze(0)
+
+    length = min(noisy_waveform.size(1), clean_waveform.size(1))
+
+    if length > FIXED_LENGTH:
+        # 동일한 랜덤 구간 선택
+        start_idx = random.randint(0, length - FIXED_LENGTH)
+        noisy_processed = noisy_waveform[:, start_idx:start_idx + FIXED_LENGTH]
+        clean_processed = clean_waveform[:, start_idx:start_idx + FIXED_LENGTH]
+    else:
+        # Zero-padding 적용
+        pad_length = FIXED_LENGTH - length
+        noisy_padding = torch.zeros((noisy_waveform.size(0), pad_length), dtype=noisy_waveform.dtype)
+        clean_padding = torch.zeros((clean_waveform.size(0), pad_length), dtype=clean_waveform.dtype)
+
+        noisy_processed = torch.cat([noisy_waveform, noisy_padding], dim=-1)
+        clean_processed = torch.cat([clean_waveform, clean_padding], dim=-1)
+
+    return noisy_processed, clean_processed
+
+# def extend_list(list):
+#     sample_rate = 16000
+#     new_list = []
+#     for sample in list:
+#         if sample.size(-1) != sample_rate:
+#             # new_sample = sample
+#             new_sample = torch.cat([sample, sample[:, :sample_rate-sample.size(-1)]], dim=-1)
+#             for i in range(0, int(sample_rate / sample.size(-1)) -1):
+#                 new_sample = torch.cat([new_sample, new_sample[:, :sample_rate-new_sample.size(-1)]], dim=-1)
+#             new_list.append(new_sample)
+#         else:
+#             new_list.append(sample)
+#         del sample
     
-    return new_list
+#     return new_list
     
 
 def add_reverb(data, reverb_source, aug_prob):

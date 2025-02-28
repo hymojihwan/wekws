@@ -22,6 +22,57 @@ import monet.dataset.processor as processor
 from monet.utils.file_utils import read_lists
 from monet.dataset.lmdb_data import LmdbData
 
+def ScanAudioFiles(root_dir, ver):
+    sample_per_cls = sample_per_cls_v1 if ver == 1 else sample_per_cls_v2
+    audio_paths, labels = [], []
+    for path, _, files in sorted(os.walk(root_dir, followlinks=True)):
+        random.shuffle(files)
+        for idx, filename in enumerate(files):
+            if not filename.endswith(".wav"):
+                continue
+            dataset, class_name = path.split("/")[-2:]
+            if class_name in ("_unknown_", "_silence_"):  # balancing
+                if "train" in dataset and idx == sample_per_cls[0]:
+                    break
+                if "valid" in dataset and idx == sample_per_cls[1]:
+                    break
+                if "test" in dataset and idx == sample_per_cls[2]:
+                    break
+            audio_paths.append(os.path.join(path, filename))
+            labels.append(label_dict[class_name])
+    return audio_paths, labels
+
+# class SpeechCommand(Dataset):
+#     """GSC"""
+
+#     def __init__(self, root_dir, ver, transform=None):
+#         self.transform = transform
+#         self.data_list, self.labels = ScanAudioFiles(root_dir, ver)
+
+#     def __len__(self):
+#         return len(self.labels)
+
+#     def __getitem__(self, idx):
+#         audio_path = self.data_list[idx]
+#         sample, _ = torchaudio.load(audio_path)
+#         if self.transform:
+#             sample = self.transform(sample)
+#         label = self.labels[idx]
+#         return sample, label
+
+class Padding:
+    """zero pad to have 1 sec len"""
+
+    def __init__(self):
+        self.output_len = SR
+
+    def __call__(self, x):
+        pad_len = self.output_len - x.shape[-1]
+        if pad_len > 0:
+            x = torch.cat([x, torch.zeros([x.shape[0], pad_len])], dim=-1)
+        elif pad_len < 0:
+            raise ValueError("no sample exceed 1sec in GSC.")
+        return x
 
 class Processor(IterableDataset):
     def __init__(self, source, f, *args, **kw):
@@ -133,6 +184,47 @@ def Dataset(data_list_file, conf,
     shuffle = conf.get('shuffle', True)
     dataset = DataList(lists, shuffle=shuffle, partition=partition)
     dataset = Processor(dataset, processor.parse_raw)
+    filter_conf = conf.get('filter_conf', {})
+    dataset = Processor(dataset, processor.filter, **filter_conf)
+
+    resample_conf = conf.get('resample_conf', {})
+    dataset = Processor(dataset, processor.resample, **resample_conf)
+
+    speed_perturb = conf.get('speed_perturb', False)
+    if speed_perturb:
+        dataset = Processor(dataset, processor.speed_perturb)
+    if reverb_lmdb and conf.get('reverb_prob', 0) > 0:
+        reverb_data = LmdbData(reverb_lmdb)
+        dataset = Processor(dataset, processor.add_reverb,
+                            reverb_data, conf['reverb_prob'])
+    if noise_lmdb and conf.get('noise_prob', 0) > 0:
+        noise_data = LmdbData(noise_lmdb)
+        dataset = Processor(dataset, processor.add_noise,
+                            noise_data, conf['noise_prob'])
+    feature_extraction_conf = conf.get('feature_extraction_conf', {})
+    if feature_extraction_conf['feature_type'] == 'mfcc':
+        dataset = Processor(dataset, processor.compute_mfcc,
+                            **feature_extraction_conf)
+    elif feature_extraction_conf['feature_type'] == 'fbank':
+        dataset = Processor(dataset, processor.compute_fbank,
+                            **feature_extraction_conf)
+    elif feature_extraction_conf['feature_type'] == 'logmel':
+        dataset = Processor(dataset, processor.compute_logmel,
+                            **feature_extraction_conf)
+    spec_aug = conf.get('spec_aug', True)
+    if spec_aug:
+        spec_aug_conf = conf.get('spec_aug_conf', {})
+        dataset = Processor(dataset, processor.spec_aug, **spec_aug_conf)
+
+    context_expansion = conf.get('context_expansion', False)
+    if context_expansion:
+        context_expansion_conf = conf.get('context_expansion_conf', {})
+        dataset = Processor(dataset, processor.context_expansion,
+                            **context_expansion_conf)
+
+    frame_skip = conf.get('frame_skip', 1)
+    if frame_skip > 1:
+        dataset = Processor(dataset, processor.frame_skip, frame_skip)
 
     if shuffle:
         shuffle_conf = conf.get('shuffle_conf', {})
